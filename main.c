@@ -10,6 +10,7 @@
 #include "f_util.h"
 #include "ff.h"
 
+#define VERSION "1.0.3"
 // ============ PIN DEFINITIONS ============
 #define LED_PIN 25
 #define FREQ_PIN 3      // External ~1 MHz signal to measure
@@ -83,7 +84,7 @@ typedef struct {
 
 typedef struct {
     float elapsed_sec;
-    float freq_hz;
+    float delta_hz;
     float accel_x;
     float accel_y;
     float accel_z;
@@ -103,6 +104,7 @@ static int buffer_index = 0;
 
 static mpu_accumulator_t mpu_acc = {0, 0, 0, 0, 0};
 static float elapsed_sec = 0.0f;  // Elapsed time in seconds (float)
+static float previous_freq = 0.0f;  // Previous frequency for delta calculation
 
 static FIL fil;
 static uint8_t mpu6050_addr = 0x68;
@@ -239,14 +241,13 @@ void write_buffer_to_sd(void) {
     for (int i = 0; i < buffer_index; i++) {
         f_printf(&fil, "%.2f,%.2f,%.4f,%.4f,%.4f,%.2f\n",
                  data_buffer[i].elapsed_sec,
-                 data_buffer[i].freq_hz,
+                 data_buffer[i].delta_hz,
                  data_buffer[i].accel_x,
                  data_buffer[i].accel_y,
                  data_buffer[i].accel_z,
                  data_buffer[i].temp_c);
     }
     f_sync(&fil);
-    printf("Wrote %d samples to SD card\n", buffer_index);
     buffer_index = 0;
     blink_brief(2);  // 2 ms LED blink after write
 }
@@ -257,12 +258,11 @@ int main() {
     
     // Initial boot pattern: 3 blinks
     blink_led(3);
-    printf("Terminal ready\n");
     
-    // Wait 4 seconds
-    sleep_ms(4000);
+    // Wait for USB serial receive end connection (if connected)
+    sleep_ms(3000);
 
-    printf("Pico Frequency Counter + MPU-6050 Logger\n");
+    printf("Pico Frequency Counter + MPU-6050 Logger v%s\n", VERSION);
 
     // Initialize I2C for RTC
     i2c_init(I2C_RTC, 400 * 1000);
@@ -366,6 +366,35 @@ int main() {
     pio_enable_sm_mask_in_sync(pio, mask);
 
     printf("Ready to measure (250 ms gate windows)\n");
+    printf("Waiting for first frequency measurement...\n");
+
+    // Wait for the first frequency measurement to arrive
+    while (!g_result_ready) {
+        // Keep reading MPU to accumulate samples during this wait
+        mpu6050_reading_t mpu = read_mpu6050();
+        if (mpu.valid) {
+            mpu_acc.sum_x += mpu.accel_x;
+            mpu_acc.sum_y += mpu.accel_y;
+            mpu_acc.sum_z += mpu.accel_z;
+            mpu_acc.sum_temp += mpu.temperature;
+            mpu_acc.count++;
+        }
+        tight_loop_contents();
+    }
+
+    // Process the first measurement
+    g_result_ready = false;
+    double initial_freq_hz = (double)g_pulse_count * SYS_CLOCK_HZ / (double)g_clock_cycles;
+    previous_freq = (float)initial_freq_hz;
+
+    printf("Initial frequency: %.2f Hz\n", initial_freq_hz);
+
+    // Reset MPU accumulator (discard warmup samples)
+    mpu_acc.sum_x = mpu_acc.sum_y = mpu_acc.sum_z = mpu_acc.sum_temp = 0;
+    mpu_acc.count = 0;
+
+    // Reset elapsed time for actual data logging
+    elapsed_sec = 0.0f;
 
     // Read RTC again just before starting data collection for accurate start time
     ds3231_time_t recording_start_time;
@@ -376,7 +405,8 @@ int main() {
         f_printf(&fil, "# Start: 20%02d-%02d-%02d %02d:%02d:%02d UTC\n",
                  recording_start_time.year, recording_start_time.month, recording_start_time.date,
                  recording_start_time.hours, recording_start_time.minutes, recording_start_time.seconds);
-        f_printf(&fil, "elapsed_sec,freq_hz,accel_x,accel_y,accel_z,temp_c\n");
+        f_printf(&fil, "# Initial frequency: %.2f Hz\n", initial_freq_hz);
+        f_printf(&fil, "elapsed_sec,delta_hz,accel_x,accel_y,accel_z,temp_c\n");
         f_sync(&fil);
     }
 
@@ -399,9 +429,6 @@ int main() {
             // Calculate frequency
             double freq_hz = (double)g_pulse_count * SYS_CLOCK_HZ / (double)g_clock_cycles;
 
-            // Save sample count before resetting accumulator
-            int samples_collected = mpu_acc.count;
-
             // Average MPU readings collected during this 250 ms window
             float avg_x = (mpu_acc.count > 0) ? mpu_acc.sum_x / mpu_acc.count : 0;
             float avg_y = (mpu_acc.count > 0) ? mpu_acc.sum_y / mpu_acc.count : 0;
@@ -412,25 +439,34 @@ int main() {
             mpu_acc.sum_x = mpu_acc.sum_y = mpu_acc.sum_z = mpu_acc.sum_temp = 0;
             mpu_acc.count = 0;
 
+            // Calculate delta from previous frequency
+            float delta_hz = (float)freq_hz - previous_freq;
+            previous_freq = (float)freq_hz;
+
             // Store data point in buffer
             if (buffer_index < BUFFER_SIZE) {
                 data_buffer[buffer_index].elapsed_sec = elapsed_sec;
-                data_buffer[buffer_index].freq_hz = (float)freq_hz;
+                data_buffer[buffer_index].delta_hz = delta_hz;
                 data_buffer[buffer_index].accel_x = avg_x;
                 data_buffer[buffer_index].accel_y = avg_y;
                 data_buffer[buffer_index].accel_z = avg_z;
                 data_buffer[buffer_index].temp_c = avg_temp;
                 buffer_index++;
-
-                printf("%.2f s: freq=%.2f Hz, ax=%.4f, ay=%.4f, az=%.4f, T=%.2f C (samples=%d)\n",
-                       elapsed_sec, freq_hz, avg_x, avg_y, avg_z, avg_temp, samples_collected);
             }
 
             // Increment elapsed time (each window is 250 ms)
             elapsed_sec += 0.25f;
 
+            // Check if we're about to write and set marker
+            bool will_write = (buffer_index >= BUFFER_SIZE);
+            const char *write_marker = will_write ? " (W)" : "";
+
+            // Print with fixed-width columns: freq=10.2f, delta=+8.2f (with sign)
+            printf("%.2f s: freq=%10.2f Hz, delta=%+8.2f Hz, ax=%.4f, ay=%.4f, az=%.4f, T=%.2f C%s\n",
+                   elapsed_sec, freq_hz, delta_hz, avg_x, avg_y, avg_z, avg_temp, write_marker);
+
             // Write to SD card when buffer reaches 40 samples (10 seconds)
-            if (buffer_index >= BUFFER_SIZE) {
+            if (will_write) {
                 write_buffer_to_sd();
             }
         }
