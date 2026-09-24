@@ -1,27 +1,18 @@
 #include <stdio.h>
+#include <stdbool.h>
 #include "pico/stdlib.h"
-#include "hardware/gpio.h"
+#include "hardware/pio.h"
+#include "hardware/irq.h"
 #include "hardware/i2c.h"
+#include "hardware/gpio.h"
+#include "freq_counter.pio.h"
 #include "hw_config.h"
 #include "f_util.h"
 #include "ff.h"
 
-#define VERSION "1.0.1"
-
-// MPU-6050 Calibration Enable/Disable
-#define ENABLE_CALIBRATION 1
-
-// MPU-6050 Calibration Constants
-// Measured on 2026-09-24 using cube face and edge method
-// Apply when ENABLE_CALIBRATION = 1: x_cal = (x_raw - offset_x) * scale_x
-#define CALIB_OFFSET_X 0.03092250f
-#define CALIB_SCALE_X  1.00047773f
-#define CALIB_OFFSET_Y -0.01023000f
-#define CALIB_SCALE_Y  0.99378882f
-#define CALIB_OFFSET_Z -0.07085750f
-#define CALIB_SCALE_Z  0.97970780f
-
+// ============ PIN DEFINITIONS ============
 #define LED_PIN 25
+#define FREQ_PIN 3      // External ~1 MHz signal to measure
 
 // I2C for RTC (DS3231)
 #define I2C_RTC i2c1
@@ -33,17 +24,37 @@
 #define I2C_MPU i2c0
 #define I2C_MPU_SDA 0
 #define I2C_MPU_SCL 1
-#define MPU6050_ADDR_LOW 0x68
-#define MPU6050_ADDR_HIGH 0x69
+#define MPU6050_ADDR 0x68
 
-#define BUFFER_SIZE 12
+// Frequency counter PIO pins
+#define GATE_PIN      2
+#define PULSE_FIN_PIN 4
 
-// MPU-6050 registers
+// ============ MPU-6050 CONFIGURATION ============
 #define MPU6050_PWR_MGMT_1 0x6B
 #define MPU6050_ACCEL_CONFIG 0x1C
 #define MPU6050_ACCEL_XOUT_H 0x3B
 #define MPU6050_TEMP_OUT_H 0x41
 
+// MPU-6050 Calibration Enable/Disable
+#define ENABLE_CALIBRATION 1
+
+// Calibration Constants (measured 2026-09-24)
+#define CALIB_OFFSET_X 0.03092250f
+#define CALIB_SCALE_X  1.00047773f
+#define CALIB_OFFSET_Y -0.01023000f
+#define CALIB_SCALE_Y  0.99378882f
+#define CALIB_OFFSET_Z -0.07085750f
+#define CALIB_SCALE_Z  0.97970780f
+
+// ============ FREQUENCY COUNTER CONFIGURATION ============
+#define SYS_CLOCK_HZ         125000000.0
+#define GATE_NOMINAL_CYCLES  ((uint32_t)(SYS_CLOCK_HZ * 0.250))  // 250 ms
+
+// ============ SD CARD CONFIGURATION ============
+#define BUFFER_SIZE 40  // Write every 10 seconds (40 samples × 250 ms)
+
+// ============ TYPE DEFINITIONS ============
 typedef struct {
     uint8_t seconds;
     uint8_t minutes;
@@ -63,27 +74,40 @@ typedef struct {
 } mpu6050_reading_t;
 
 typedef struct {
-    uint32_t epoch;
+    float sum_x;
+    float sum_y;
+    float sum_z;
+    float sum_temp;
+    int count;
+} mpu_accumulator_t;
+
+typedef struct {
+    float elapsed_sec;
+    float freq_hz;
     float accel_x;
     float accel_y;
     float accel_z;
-    float temperature;
+    float temp_c;
 } data_point_t;
 
-static ds3231_time_t current_time;
+// ============ GLOBAL STATE ============
+static PIO pio = pio0;
+static uint sm_gate, sm_clock, sm_pulse;
+
+static volatile uint32_t g_clock_cycles;
+static volatile uint32_t g_pulse_count;
+static volatile bool g_result_ready;
+
 static data_point_t data_buffer[BUFFER_SIZE];
 static int buffer_index = 0;
-static uint8_t mpu6050_addr = 0;  // Will store detected address
 
-// Apply calibration constants to acceleration values
-void apply_calibration(float *x, float *y, float *z) {
-#if ENABLE_CALIBRATION
-    *x = (*x - CALIB_OFFSET_X) * CALIB_SCALE_X;
-    *y = (*y - CALIB_OFFSET_Y) * CALIB_SCALE_Y;
-    *z = (*z - CALIB_OFFSET_Z) * CALIB_SCALE_Z;
-#endif
-}
+static mpu_accumulator_t mpu_acc = {0, 0, 0, 0, 0};
+static float elapsed_sec = 0.0f;  // Elapsed time in seconds (float)
 
+static FIL fil;
+static uint8_t mpu6050_addr = 0x68;
+
+// ============ LED FUNCTIONS ============
 void blink_led(int times) {
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
@@ -104,12 +128,7 @@ void blink_brief(int duration_ms) {
     gpio_put(LED_PIN, 0);
 }
 
-void blink_double() {
-    blink_brief(5);
-    sleep_ms(100);
-    blink_brief(5);
-}
-
+// ============ RTC FUNCTIONS ============
 uint8_t bcd_to_decimal(uint8_t bcd) {
     return ((bcd >> 4) * 10) + (bcd & 0x0F);
 }
@@ -130,72 +149,7 @@ void read_ds3231_time(ds3231_time_t *time) {
     time->year = bcd_to_decimal(buffer[6]);
 }
 
-static uint32_t ds3231_to_epoch(ds3231_time_t *time) {
-    uint32_t days = 0;
-    
-    for (int y = 0; y < time->year; y++) {
-        days += (y % 4 == 0) ? 366 : 365;
-    }
-    
-    int days_in_month[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    if (time->year % 4 == 0) days_in_month[2] = 29;
-    
-    for (int m = 1; m < time->month; m++) {
-        days += days_in_month[m];
-    }
-    
-    days += time->date - 1;
-    
-    uint32_t epoch = (days + 10957) * 86400;
-    epoch += time->hours * 3600;
-    epoch += time->minutes * 60;
-    epoch += time->seconds;
-    
-    return epoch;
-}
-
-// Detect MPU-6050 on I2C bus
-void detect_mpu6050(void) {
-    uint8_t reg = 0x75;  // WHO_AM_I register
-    uint8_t data;
-    
-    printf("Detecting MPU-6050...\n");
-    
-    // Try 0x69 first
-    i2c_write_blocking(I2C_MPU, MPU6050_ADDR_HIGH, &reg, 1, true);
-    if (i2c_read_blocking(I2C_MPU, MPU6050_ADDR_HIGH, &data, 1, false) > 0 && data == 0x68) {
-        mpu6050_addr = MPU6050_ADDR_HIGH;
-        printf("MPU-6050 detected at address 0x69\n");
-        return;
-    }
-    
-    // Try 0x68
-    i2c_write_blocking(I2C_MPU, MPU6050_ADDR_LOW, &reg, 1, true);
-    if (i2c_read_blocking(I2C_MPU, MPU6050_ADDR_LOW, &data, 1, false) > 0 && data == 0x68) {
-        mpu6050_addr = MPU6050_ADDR_LOW;
-        printf("MPU-6050 detected at address 0x68\n");
-        return;
-    }
-    
-    printf("MPU-6050 not found on I2C bus\n");
-}
-
-// Initialize MPU-6050
-void OLD_init_mpu6050(void) {
-    if (!mpu6050_addr) return;
-    
-    // Wake up from sleep mode
-    uint8_t cmd[2] = {MPU6050_PWR_MGMT_1, 0x00};
-    i2c_write_blocking(I2C_MPU, mpu6050_addr, cmd, 2, false);
-    sleep_ms(10);
-    
-    // Set accel config to ±2g range (0x00)
-    cmd[0] = MPU6050_ACCEL_CONFIG;
-    cmd[1] = 0x00;
-    i2c_write_blocking(I2C_MPU, mpu6050_addr, cmd, 2, false);
-}
-
-
+// ============ MPU-6050 FUNCTIONS ============
 void init_mpu6050(void) {
     if (!mpu6050_addr) return;
     
@@ -222,10 +176,18 @@ void init_mpu6050(void) {
     i2c_write_blocking(I2C_MPU, mpu6050_addr, cmd, 2, false);
     sleep_ms(10);
     
-    // Configure sample rate divider (lower value = faster sampling)
+    // Configure sample rate divider (1 kHz sampling)
     cmd[0] = 0x19;  // SMPRT_DIV register
     cmd[1] = 0x00;  // Sample rate = 1000 / (1 + 0) = 1kHz
     i2c_write_blocking(I2C_MPU, mpu6050_addr, cmd, 2, false);
+}
+
+void apply_calibration(float *x, float *y, float *z) {
+#if ENABLE_CALIBRATION
+    *x = (*x - CALIB_OFFSET_X) * CALIB_SCALE_X;
+    *y = (*y - CALIB_OFFSET_Y) * CALIB_SCALE_Y;
+    *z = (*z - CALIB_OFFSET_Z) * CALIB_SCALE_Z;
+#endif
 }
 
 mpu6050_reading_t read_mpu6050(void) {
@@ -248,7 +210,7 @@ mpu6050_reading_t read_mpu6050(void) {
     result.accel_y = accel_y_raw / 16384.0f;
     result.accel_z = accel_z_raw / 16384.0f;
     
-    // Apply calibration if enabled
+    // Apply calibration
     apply_calibration(&result.accel_x, &result.accel_y, &result.accel_z);
     
     // Convert temperature (raw / 340 + 36.53)
@@ -259,293 +221,222 @@ mpu6050_reading_t read_mpu6050(void) {
     return result;
 }
 
-void list_directory(const char *path, int indent) {
-    FRESULT fr;
-    DIR dir;
-    FILINFO fno;
-    
-    fr = f_opendir(&dir, path);
-    if (fr != FR_OK) {
-        printf("Failed to open directory: %s\n", path);
-        return;
-    }
-    
-    while (1) {
-        fr = f_readdir(&dir, &fno);
-        if (fr != FR_OK || fno.fname[0] == 0) break;
-        
-        for (int i = 0; i < indent; i++) printf("  ");
-        
-        if (fno.fattrib & AM_DIR) {
-            printf("[DIR]  %s\n", fno.fname);
-            char subpath[256];
-            snprintf(subpath, sizeof(subpath), "%s/%s", path, fno.fname);
-            list_directory(subpath, indent + 1);
-        } else {
-            printf("[FILE] %s (%lu bytes)\n", fno.fname, fno.fsize);
-        }
-    }
-    
-    f_closedir(&dir);
+// ============ FREQUENCY COUNTER ISR ============
+static void pio0_isr(void) {
+    uint32_t raw_clock = pio_sm_get_blocking(pio, sm_clock);
+    uint32_t raw_pulse = pio_sm_get_blocking(pio, sm_pulse);
+
+    g_clock_cycles = 2u * (0xFFFFFFFFu - raw_clock);  // 2 cycles/iteration in clock_count
+    g_pulse_count  = (0xFFFFFFFEu) - raw_pulse;        // pulse_count's X started at max-1
+    g_result_ready = true;
+
+    pio_interrupt_clear(pio, 0);  // lets gate SM proceed to the next window
 }
 
-void scan_i2c_bus(i2c_inst_t *i2c, const char *bus_name) {
-    printf("\nScanning %s for I2C devices:\n", bus_name);
-    printf("Found devices at addresses: ");
-    
-    bool found_any = false;
-    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
-        uint8_t rxdata;
-        int result = i2c_read_blocking(i2c, addr, &rxdata, 1, false);
-        if (result > 0) {
-            printf("0x%02X ", addr);
-            found_any = true;
-        }
+// ============ SD CARD FUNCTIONS ============
+void write_buffer_to_sd(void) {
+    // Write buffered data to SD card
+    for (int i = 0; i < buffer_index; i++) {
+        f_printf(&fil, "%.2f,%.2f,%.4f,%.4f,%.4f,%.2f\n",
+                 data_buffer[i].elapsed_sec,
+                 data_buffer[i].freq_hz,
+                 data_buffer[i].accel_x,
+                 data_buffer[i].accel_y,
+                 data_buffer[i].accel_z,
+                 data_buffer[i].temp_c);
     }
-    
-    if (!found_any) {
-        printf("(none)");
-    }
-    printf("\n\n");
+    f_sync(&fil);
+    printf("Wrote %d samples to SD card\n", buffer_index);
+    buffer_index = 0;
+    blink_brief(2);  // 2 ms LED blink after write
 }
 
-void dump_registers(i2c_inst_t *i2c, uint8_t addr, const char *device_name) {
-    printf("\nRegister dump for %s at 0x%02X:\n", device_name, addr);
-    printf("Reg  | Hex Value\n");
-    printf("-----+-----------\n");
-    
-    for (uint8_t reg = 0x00; reg < 0x80; reg++) {
-        uint8_t data = 0;
-        i2c_write_blocking(i2c, addr, &reg, 1, true);
-        i2c_read_blocking(i2c, addr, &data, 1, false);
-        
-        if (reg % 16 == 0) printf("\n0x%02X | ", reg);
-        printf("%02X ", data);
-    }
-    printf("\n\n");
-}
-
-typedef struct {
-    float sum_x;
-    float sum_y;
-    float sum_z;
-    float sum_temp;
-    int count;
-} mpu_accumulator_t;
-
-mpu6050_reading_t average_mpu_readings(int num_readings) {
-    mpu_accumulator_t acc = {0, 0, 0, 0, 0};
-    
-    for (int i = 0; i < num_readings; i++) {
-        uint8_t buffer[8];
-        uint8_t reg = MPU6050_ACCEL_XOUT_H;
-        
-        i2c_write_blocking(I2C_MPU, mpu6050_addr, &reg, 1, true);
-        i2c_read_blocking(I2C_MPU, mpu6050_addr, buffer, 8, false);
-        
-        int16_t accel_x_raw = ((int16_t)buffer[0] << 8) | buffer[1];
-        int16_t accel_y_raw = ((int16_t)buffer[2] << 8) | buffer[3];
-        int16_t accel_z_raw = ((int16_t)buffer[4] << 8) | buffer[5];
-        int16_t temp_raw = ((int16_t)buffer[6] << 8) | buffer[7];
-        
-        float x = accel_x_raw / 16384.0f;
-        float y = accel_y_raw / 16384.0f;
-        float z = accel_z_raw / 16384.0f;
-        
-        // Apply calibration if enabled
-        apply_calibration(&x, &y, &z);
-        
-        acc.sum_x += x;
-        acc.sum_y += y;
-        acc.sum_z += z;
-        acc.sum_temp += (temp_raw / 340.0f) + 36.53f;
-        acc.count++;
-    }
-    
-    mpu6050_reading_t result;
-    result.accel_x = acc.sum_x / acc.count;
-    result.accel_y = acc.sum_y / acc.count;
-    result.accel_z = acc.sum_z / acc.count;
-    result.temperature = acc.sum_temp / acc.count;
-    result.valid = true;
-    return result;
-}
-
+// ============ MAIN ============
 int main() {
-    blink_led(3);  // initial poweron blinks happen first
-    
     stdio_init_all();
-    sleep_ms(4000);
     
-    printf("Pico SD Card Data Logger Version %s\n", VERSION);
+    // Initial boot pattern: 3 blinks
+    blink_led(3);
+    printf("Terminal ready\n");
+    
+    // Wait 4 seconds
+    sleep_ms(4000);
 
-    // Initialize I2C for RTC (i2c1 on GP6/GP7)
+    printf("Pico Frequency Counter + MPU-6050 Logger\n");
+
+    // Initialize I2C for RTC
     i2c_init(I2C_RTC, 400 * 1000);
     gpio_set_function(I2C_RTC_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_RTC_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_RTC_SDA);
     gpio_pull_up(I2C_RTC_SCL);
-    
-   
-    // Initialize I2C for MPU-6050 (i2c0 on GP0/GP1)
+
+    // Initialize I2C for MPU
     i2c_init(I2C_MPU, 400 * 1000);
     gpio_set_function(I2C_MPU_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_MPU_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_MPU_SDA);
     gpio_pull_up(I2C_MPU_SCL);
-    
-    // Scan both I2C buses  
-    scan_i2c_bus(I2C_RTC, "I2C1 (RTC bus - GP6/GP7)");
-    scan_i2c_bus(I2C_MPU, "I2C0 (MPU bus - GP0/GP1)");
-    
-    // Dump registers from device on MPU bus
-    dump_registers(I2C_MPU, 0x68, "Device on I2C0");
 
+    // Read RTC for filename and timestamp
+    ds3231_time_t start_time;
+    read_ds3231_time(&start_time);
+    printf("RTC time: 20%02d-%02d-%02d %02d:%02d:%02d UTC\n",
+           start_time.year, start_time.month, start_time.date,
+           start_time.hours, start_time.minutes, start_time.seconds);
 
-    // Detect MPU-6050
-    detect_mpu6050();
-    if (mpu6050_addr) {
-        init_mpu6050();
-    }
+    // Create filename from date/time
+    char filename[32];
+    snprintf(filename, sizeof(filename), "%02d%02d%02d%02d.csv",
+             start_time.month, start_time.date, start_time.hours, start_time.minutes);
 
+    // Initialize SD card
     printf("Initializing SD card...\n");
-    
     FATFS fs;
     FRESULT fr = f_mount(&fs, "", 1);
     if (FR_OK != fr) {
-        panic("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
+        panic("f_mount error: %d\n", fr);
     }
-    
-    blink_led(2);  // final blink pair to indicate SD card is ready
-    
-    printf("SD card mounted successfully\n");
-    
-    // Get free space
-    DWORD free_clusters;
-    FATFS *pfs;
-    fr = f_getfree("", &free_clusters, &pfs);
-    if (FR_OK == fr) {
-        uint64_t free_bytes = (uint64_t)free_clusters * pfs->csize * 512;
-        printf("Free space: %llu bytes (%.2f MB)\n", free_bytes, free_bytes / 1024.0 / 1024.0);
-    }
-    
-    printf("Directory listing:\n");
-    printf("==================\n");
-    
-    list_directory("", 0);
-    
-    printf("==================\n");
-    
-    // Read RTC and open/create CSV file for appending
-    read_ds3231_time(&current_time);
-    
-    char filename[32];
-    snprintf(filename, sizeof(filename), "%02d%02d%02d%02d.csv",
-             current_time.month, current_time.date, current_time.hours, current_time.minutes);
-    
-    FIL fil;
+
+    // Open/create CSV file
     fr = f_open(&fil, filename, FA_OPEN_APPEND | FA_WRITE);
     if (FR_OK != fr) {
-        printf("Error opening file: %s (%d)\n", filename, fr);
-    } else {
-        // Check if file is empty (new file)
-        if (f_size(&fil) == 0) {
-            f_printf(&fil, "epoch,accel_x,accel_y,accel_z,temp_C\n");
-            f_printf(&fil, "# START: 20%02d-%02d-%02d %02d:%02d:%02d\n",
-                     current_time.year, current_time.month, current_time.date,
-                     current_time.hours, current_time.minutes, current_time.seconds);
-        }
-        printf("File: %s (appending)\n", filename);
+        panic("Error opening file: %d\n", fr);
     }
-    
-    printf("Reading data every 10 seconds, writing to SD every 2 minutes...\n");
-    
-    uint8_t last_seconds = 0xFF;
-    uint32_t last_write_time = 0;
-    uint32_t epoch = 0;
-    
-    while (1) {
-        read_ds3231_time(&current_time);
-        
-        // Double blink and collect data at top of minute
-        if ((current_time.seconds == 0) && (current_time.seconds != last_seconds)) {
-            blink_double();
-            // mpu6050_reading_t mpu = read_mpu6050();
-            mpu6050_reading_t mpu = average_mpu_readings(50);
 
-            
-            epoch = ds3231_to_epoch(&current_time);
-            if (mpu.valid) {
-                printf("UTC: 20%02d-%02d-%02d %02d:%02d:%02d | Epoch: %lu | Ax=%.3f Ay=%.3f Az=%.3f T=%.2f°C\n",
-                       current_time.year, current_time.month, current_time.date,
-                       current_time.hours, current_time.minutes, current_time.seconds,
-                       epoch, mpu.accel_x, mpu.accel_y, mpu.accel_z, mpu.temperature);
-            } else {
-                printf("UTC: 20%02d-%02d-%02d %02d:%02d:%02d | Epoch: %lu | MPU-6050 not available\n",
-                       current_time.year, current_time.month, current_time.date,
-                       current_time.hours, current_time.minutes, current_time.seconds, epoch);
-            }
-            
-            // Add to buffer
-            if (buffer_index < BUFFER_SIZE) {
-                data_buffer[buffer_index].epoch = epoch;
-                data_buffer[buffer_index].accel_x = mpu.accel_x;
-                data_buffer[buffer_index].accel_y = mpu.accel_y;
-                data_buffer[buffer_index].accel_z = mpu.accel_z;
-                data_buffer[buffer_index].temperature = mpu.temperature;
-                buffer_index++;
-            }
-        }
-        // Single blink and collect data at even multiples of 10 seconds
-        else if ((current_time.seconds % 10 == 0) && (current_time.seconds != last_seconds)) {
-            blink_brief(5);
-            // mpu6050_reading_t mpu = read_mpu6050();
-            mpu6050_reading_t mpu = average_mpu_readings(50);
-            
-            epoch = ds3231_to_epoch(&current_time);
-            if (mpu.valid) {
-                printf("UTC: 20%02d-%02d-%02d %02d:%02d:%02d | Epoch: %lu | Ax=%.3f Ay=%.3f Az=%.3f T=%.2f°C\n",
-                       current_time.year, current_time.month, current_time.date,
-                       current_time.hours, current_time.minutes, current_time.seconds,
-                       epoch, mpu.accel_x, mpu.accel_y, mpu.accel_z, mpu.temperature);
-            } else {
-                printf("UTC: 20%02d-%02d-%02d %02d:%02d:%02d | Epoch: %lu | MPU-6050 not available\n",
-                       current_time.year, current_time.month, current_time.date,
-                       current_time.hours, current_time.minutes, current_time.seconds, epoch);
-            }
-            
-            // Add to buffer
-            if (buffer_index < BUFFER_SIZE) {
-                data_buffer[buffer_index].epoch = epoch;
-                data_buffer[buffer_index].accel_x = mpu.accel_x;
-                data_buffer[buffer_index].accel_y = mpu.accel_y;
-                data_buffer[buffer_index].accel_z = mpu.accel_z;
-                data_buffer[buffer_index].temperature = mpu.temperature;
-                buffer_index++;
-            }
-        }
-        
-        // Write buffer to SD card every 120 seconds (2 minutes)
-        if (buffer_index > 0 && (epoch - last_write_time) >= 120) {
-            if (FR_OK == fr) {
-                for (int i = 0; i < buffer_index; i++) {
-                    f_printf(&fil, "%lu,%.3f,%.3f,%.3f,%.2f\n",
-                             data_buffer[i].epoch,
-                             data_buffer[i].accel_x,
-                             data_buffer[i].accel_y,
-                             data_buffer[i].accel_z,
-                             data_buffer[i].temperature);
-                }
-                f_sync(&fil);
-                printf("Wrote %d samples to SD card\n", buffer_index);
-            }
-            buffer_index = 0;
-            last_write_time = epoch;
-        }
-        
-        last_seconds = current_time.seconds;
-        sleep_ms(250);
-    }
+    // Check if this is a new file (empty)
+    bool is_new_file = (f_size(&fil) == 0);
+
+    printf("File: %s (%s)\n", filename, is_new_file ? "new" : "appending");
+
+    // Initialize MPU-6050
+    init_mpu6050();
+    printf("MPU-6050 initialized\n");
     
+    // Boot complete pattern: 2 blinks
+    blink_led(2);
+
+    // Initialize frequency counter PIO
+    uint offset_gate  = pio_add_program(pio, &gate_program);
+    uint offset_clock = pio_add_program(pio, &clock_count_program);
+    uint offset_pulse = pio_add_program(pio, &pulse_count_program);
+
+    sm_gate  = pio_claim_unused_sm(pio, true);
+    sm_clock = pio_claim_unused_sm(pio, true);
+    sm_pulse = pio_claim_unused_sm(pio, true);
+
+    gpio_init(FREQ_PIN);
+    gpio_set_dir(FREQ_PIN, GPIO_IN);
+
+    pio_gpio_init(pio, GATE_PIN);
+    pio_gpio_init(pio, PULSE_FIN_PIN);
+
+    // Configure gate state machine
+    pio_sm_config c_gate = gate_program_get_default_config(offset_gate);
+    sm_config_set_in_pins(&c_gate, FREQ_PIN);
+    sm_config_set_sideset_pins(&c_gate, GATE_PIN);
+    pio_sm_set_consecutive_pindirs(pio, sm_gate, GATE_PIN, 1, true);
+    pio_sm_init(pio, sm_gate, offset_gate, &c_gate);
+
+    // Configure clock_count state machine
+    pio_sm_config c_clock = clock_count_program_get_default_config(offset_clock);
+    sm_config_set_in_pins(&c_clock, GATE_PIN);
+    sm_config_set_jmp_pin(&c_clock, PULSE_FIN_PIN);
+    pio_sm_init(pio, sm_clock, offset_clock, &c_clock);
+
+    // Configure pulse_count state machine
+    pio_sm_config c_pulse = pulse_count_program_get_default_config(offset_pulse);
+    sm_config_set_in_pins(&c_pulse, GATE_PIN);  // offset 0 = GATE_PIN, offset 1 = FREQ_PIN
+    sm_config_set_sideset_pins(&c_pulse, PULSE_FIN_PIN);
+    sm_config_set_jmp_pin(&c_pulse, GATE_PIN);
+    pio_sm_set_consecutive_pindirs(pio, sm_pulse, PULSE_FIN_PIN, 1, true);
+    pio_sm_init(pio, sm_pulse, offset_pulse, &c_pulse);
+
+    // Preload each SM's one-time constant
+    pio_sm_put_blocking(pio, sm_gate,  GATE_NOMINAL_CYCLES);
+    pio_sm_put_blocking(pio, sm_clock, 0xFFFFFFFFu);
+    pio_sm_put_blocking(pio, sm_pulse, 0xFFFFFFFEu);
+
+    // Set up interrupt
+    pio_set_irq0_source_enabled(pio, pis_interrupt0, true);
+    irq_set_exclusive_handler(PIO0_IRQ_0, pio0_isr);
+    irq_set_enabled(PIO0_IRQ_0, true);
+
+    uint32_t mask = (1u << sm_gate) | (1u << sm_clock) | (1u << sm_pulse);
+    pio_enable_sm_mask_in_sync(pio, mask);
+
+    printf("Ready to measure (250 ms gate windows)\n");
+
+    // Read RTC again just before starting data collection for accurate start time
+    ds3231_time_t recording_start_time;
+    read_ds3231_time(&recording_start_time);
+    
+    // Write actual recording start time to SD card (only if new file)
+    if (is_new_file) {
+        f_printf(&fil, "# Start: 20%02d-%02d-%02d %02d:%02d:%02d UTC\n",
+                 recording_start_time.year, recording_start_time.month, recording_start_time.date,
+                 recording_start_time.hours, recording_start_time.minutes, recording_start_time.seconds);
+        f_printf(&fil, "elapsed_sec,freq_hz,accel_x,accel_y,accel_z,temp_c\n");
+        f_sync(&fil);
+    }
+
+    // ============ MAIN LOOP ============
+    while (true) {
+        // Continuously read MPU-6050 and accumulate samples
+        mpu6050_reading_t mpu = read_mpu6050();
+        if (mpu.valid) {
+            mpu_acc.sum_x += mpu.accel_x;
+            mpu_acc.sum_y += mpu.accel_y;
+            mpu_acc.sum_z += mpu.accel_z;
+            mpu_acc.sum_temp += mpu.temperature;
+            mpu_acc.count++;
+        }
+
+        // When frequency measurement window completes
+        if (g_result_ready) {
+            g_result_ready = false;
+
+            // Calculate frequency
+            double freq_hz = (double)g_pulse_count * SYS_CLOCK_HZ / (double)g_clock_cycles;
+
+            // Save sample count before resetting accumulator
+            int samples_collected = mpu_acc.count;
+
+            // Average MPU readings collected during this 250 ms window
+            float avg_x = (mpu_acc.count > 0) ? mpu_acc.sum_x / mpu_acc.count : 0;
+            float avg_y = (mpu_acc.count > 0) ? mpu_acc.sum_y / mpu_acc.count : 0;
+            float avg_z = (mpu_acc.count > 0) ? mpu_acc.sum_z / mpu_acc.count : 0;
+            float avg_temp = (mpu_acc.count > 0) ? mpu_acc.sum_temp / mpu_acc.count : 0;
+
+            // Reset accumulator for next window
+            mpu_acc.sum_x = mpu_acc.sum_y = mpu_acc.sum_z = mpu_acc.sum_temp = 0;
+            mpu_acc.count = 0;
+
+            // Store data point in buffer
+            if (buffer_index < BUFFER_SIZE) {
+                data_buffer[buffer_index].elapsed_sec = elapsed_sec;
+                data_buffer[buffer_index].freq_hz = (float)freq_hz;
+                data_buffer[buffer_index].accel_x = avg_x;
+                data_buffer[buffer_index].accel_y = avg_y;
+                data_buffer[buffer_index].accel_z = avg_z;
+                data_buffer[buffer_index].temp_c = avg_temp;
+                buffer_index++;
+
+                printf("%.2f s: freq=%.2f Hz, ax=%.4f, ay=%.4f, az=%.4f, T=%.2f C (samples=%d)\n",
+                       elapsed_sec, freq_hz, avg_x, avg_y, avg_z, avg_temp, samples_collected);
+            }
+
+            // Increment elapsed time (each window is 250 ms)
+            elapsed_sec += 0.25f;
+
+            // Write to SD card when buffer reaches 40 samples (10 seconds)
+            if (buffer_index >= BUFFER_SIZE) {
+                write_buffer_to_sd();
+            }
+        }
+
+        tight_loop_contents();
+    }
+
     return 0;
 }
