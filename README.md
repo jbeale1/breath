@@ -20,3 +20,5 @@ Initial frequency: 965186.58 Hz
 2.25 s: freq= 966522.21 Hz, delta=  +44.44 Hz, ax=0.7265, ay=0.1023, az=0.6838, T=23.95 C
 2.50 s: freq= 966564.41 Hz, delta=  +42.25 Hz, ax=0.7268, ay=0.1026, az=0.6848, T=23.96 C
 ```
+
+![Block Diagram of data logger](block_diagram.png)
