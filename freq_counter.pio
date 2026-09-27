@@ -1,0 +1,64 @@
+; ---------------------------------------------------------------------------
+; Reciprocal frequency counter for RP2040 PIO.
+;
+; Three cooperating state machines:
+;   gate         - opens a measurement window synchronized to input edges
+;   clock_count  - counts system-clock cycles during the window   (2 cyc/iter)
+;   pulse_count  - counts input signal edges during the window
+;
+; Frequency = pulse_count * f_sys / clock_cycles
+;
+; Pin roles (set up in the C driver):
+;   FREQ_PIN      - the signal being measured (external)
+;   GATE_PIN      - internal flag pin, MUST equal FREQ_PIN - 1 (no wiring needed)
+;   PULSE_FIN_PIN - internal flag pin, any free GPIO (no wiring needed)
+; ---------------------------------------------------------------------------
+
+.program gate
+.side_set 1 opt
+    pull block                  ; load gate length (in PIO cycles) once
+.wrap_target
+    mov    x, osr               ; reload gate length each pass (OSR retains it)
+    wait   0 pin 0               ; wait for input LOW
+    wait   1 pin 0     side 1    ; rising edge = window START-of-search; idle high
+gate_loop:
+    jmp    x--, gate_loop side 0 ; hold gate LOW (window OPEN) for X cycles
+    wait   0 pin 0                ; wait for input LOW
+    wait   1 pin 0     side 1     ; next rising edge = window STOP; gate HIGH again
+    irq    wait 0                  ; tell the CPU a result is ready (blocks until cleared)
+    wait   1 irq 4                 ; wait for clock_count to finish (auto-clears flag 4)
+    wait   1 irq 5                 ; wait for pulse_count to finish (auto-clears flag 5)
+.wrap
+
+.program clock_count
+    pull block                  ; load max count (0xFFFFFFFF) once
+.wrap_target
+    mov    x, osr               ; reload max count each pass
+    wait   1 pin 0               ; wait gate HIGH (idle, before this window)
+    wait   0 pin 0               ; wait gate LOW -> window START
+counter_loop:
+    jmp    pin, count_done      ; jmp_pin = PULSE_FIN_PIN: high => window ended
+    jmp    x--, counter_loop    ; else keep counting down (2 cycles/iteration)
+count_done:
+    mov    isr, x
+    push   block
+    irq    wait 4
+.wrap
+
+.program pulse_count
+.side_set 1 opt
+    pull block                  ; load (max count - 1) once
+.wrap_target
+    mov    x, osr                ; reload each pass
+    wait   1 pin 0                ; in_base offset 0 = GATE_PIN: wait HIGH (idle)
+    wait   0 pin 0     side 0     ; wait LOW -> window START; also drop PULSE_FIN_PIN
+counter_loop:
+    wait   0 pin 1                 ; in_base offset 1 = FREQ_PIN: wait LOW
+    wait   1 pin 1                 ; wait HIGH -> one input edge detected
+    jmp    pin, count_done         ; jmp_pin = GATE_PIN: high => window ended, stop
+    jmp    x--, counter_loop       ; else count this edge, loop
+count_done:
+    mov    isr, x       side 1     ; push result; raise PULSE_FIN_PIN -> tells clock_count to stop
+    push   block
+    irq    wait 5
+.wrap

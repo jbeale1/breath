@@ -1,30 +1,48 @@
+/*
+ * Sleep study data logger: Pico Frequency Counter + MPU-6050
+ * 
+ * Measures respiration using chest belt inductance (varies with circumference).
+ * The frequency of an LC oscillator (985 kHz +/- 10 kHz) is read via RP2040 PIO
+ * with 250ms gate windows. Also logs accelerometer data and temperature 
+ * from MPU-6050 and records data at 4 Hz to SD card.
+ * Real-time clock (DS3231) provides timestamps. WS2812 RGB LED for status.
+ * Tested with Waveshare RP2040-Zero board.
+ * 
+ * J. Beale, 2026-09-27
+ */
+
+
 #include <stdio.h>
 #include <stdbool.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/pio.h"
 #include "hardware/irq.h"
 #include "hardware/i2c.h"
 #include "hardware/gpio.h"
+#include "hardware/clocks.h"
 #include "freq_counter.pio.h"
+#include "ws2812.pio.h"
 #include "hw_config.h"
 #include "f_util.h"
 #include "ff.h"
 
-#define VERSION "1.0.3"
+#define VERSION "1.1.2"
+
 // ============ PIN DEFINITIONS ============
-#define LED_PIN 25
+#define WS2812_PIN 16   // WS2812 RGB LED on RP2040-Zero
 #define FREQ_PIN 3      // External ~1 MHz signal to measure
 
-// I2C for RTC (DS3231)
-#define I2C_RTC i2c1
-#define I2C_RTC_SDA 6
-#define I2C_RTC_SCL 7
+// I2C for RTC (DS3231) - on I2C0
+#define I2C_RTC i2c0
+#define I2C_RTC_SDA 0
+#define I2C_RTC_SCL 1
 #define DS3231_ADDR 0x68
 
-// I2C for MPU-6050
-#define I2C_MPU i2c0
-#define I2C_MPU_SDA 0
-#define I2C_MPU_SCL 1
+// I2C for MPU-6050 - on I2C1
+#define I2C_MPU i2c1
+#define I2C_MPU_SDA 14
+#define I2C_MPU_SCL 15
 #define MPU6050_ADDR 0x68
 
 // Frequency counter PIO pins
@@ -92,8 +110,12 @@ typedef struct {
 } data_point_t;
 
 // ============ GLOBAL STATE ============
-static PIO pio = pio0;
+// Use PIO0 for frequency counter, PIO1 for WS2812 LED
+static PIO pio_freq = pio0;    // Frequency counter programs
+static PIO pio_led = pio1;     // WS2812 LED program
+
 static uint sm_gate, sm_clock, sm_pulse;
+static uint sm_ws2812;  // State machine for WS2812 LED on pio1
 
 static volatile uint32_t g_clock_cycles;
 static volatile uint32_t g_pulse_count;
@@ -109,25 +131,61 @@ static float previous_freq = 0.0f;  // Previous frequency for delta calculation
 static FIL fil;
 static uint8_t mpu6050_addr = 0x68;
 
-// ============ LED FUNCTIONS ============
+// ============ LED FUNCTIONS (WS2812) ============
+// Colors in GRB format (WS2812 native format)
+#define LED_WHITE  urgb_u32(255, 255, 255)
+#define LED_RED    urgb_u32(255, 0, 0)
+#define LED_GREEN  urgb_u32(0, 255, 0)
+#define LED_BLUE   urgb_u32(0, 0, 255)
+#define LED_BLACK  urgb_u32(0, 0, 0)
+
+// 10% brightness colors for testing
+#define LED_RED_10PCT    urgb_u32(25, 0, 0)
+#define LED_GREEN_10PCT  urgb_u32(0, 25, 0)
+#define LED_BLUE_10PCT   urgb_u32(0, 0, 25)
+#define LED_YELLOW_10PCT urgb_u32(25, 25, 0)
+
+static inline void put_pixel(PIO pio, uint sm, uint32_t pixel_grb) {
+    pio_sm_put_blocking(pio, sm, pixel_grb << 8u);
+}
+
+static inline uint32_t urgb_u32(uint8_t r, uint8_t g, uint8_t b) {
+    return
+            ((uint32_t) (r) << 8) |
+            ((uint32_t) (g) << 16) |
+            (uint32_t) (b);
+}
+
+void ws2812_led_on(uint32_t grb) {
+    put_pixel(pio_led, sm_ws2812, grb);
+    sleep_us(150);  // WS2812 reset pulse (50+ μs required)
+}
+
+void ws2812_led_off(void) {
+    put_pixel(pio_led, sm_ws2812, LED_BLACK);
+    sleep_us(150);
+}
+
 void blink_led(int times) {
-    gpio_init(LED_PIN);
-    gpio_set_dir(LED_PIN, GPIO_OUT);
-    
     for (int i = 0; i < times; i++) {
-        gpio_put(LED_PIN, 1);
+        printf("  Blink %d: ON\n", i + 1);
+        fflush(stdout);
+        ws2812_led_on(LED_WHITE);
         sleep_ms(200);
-        gpio_put(LED_PIN, 0);
+        printf("  Blink %d: OFF\n", i + 1);
+        fflush(stdout);
+        ws2812_led_off();
         sleep_ms(200);
     }
+    printf("  Blink complete\n");
+    fflush(stdout);
 }
 
 void blink_brief(int duration_ms) {
-    gpio_init(LED_PIN);
-    gpio_set_dir(LED_PIN, GPIO_OUT);
-    gpio_put(LED_PIN, 1);
+    // ws2812_led_on(LED_WHITE);
+    ws2812_led_on(LED_GREEN_10PCT);  // don't use full brightness for brief blink    
     sleep_ms(duration_ms);
-    gpio_put(LED_PIN, 0);
+    ws2812_led_off();
 }
 
 // ============ RTC FUNCTIONS ============
@@ -138,8 +196,10 @@ uint8_t bcd_to_decimal(uint8_t bcd) {
 void read_ds3231_time(ds3231_time_t *time) {
     uint8_t buffer[7];
     uint8_t reg = 0x00;
-    
-    i2c_write_blocking(I2C_RTC, DS3231_ADDR, &reg, 1, true);
+
+    // Try without repeated START - do write first with STOP
+    i2c_write_blocking(I2C_RTC, DS3231_ADDR, &reg, 1, false);  // false = STOP, not repeated START
+    sleep_ms(1);  // Small delay between operations
     i2c_read_blocking(I2C_RTC, DS3231_ADDR, buffer, 7, false);
     
     time->seconds = bcd_to_decimal(buffer[0]);
@@ -154,30 +214,30 @@ void read_ds3231_time(ds3231_time_t *time) {
 // ============ MPU-6050 FUNCTIONS ============
 void init_mpu6050(void) {
     if (!mpu6050_addr) return;
-    
+
     // Wake up from sleep mode
     uint8_t cmd[2] = {MPU6050_PWR_MGMT_1, 0x00};
     i2c_write_blocking(I2C_MPU, mpu6050_addr, cmd, 2, false);
     sleep_ms(100);
-    
+
     // Reset all registers
     cmd[0] = MPU6050_PWR_MGMT_1;
     cmd[1] = 0x80;  // Reset bit
     i2c_write_blocking(I2C_MPU, mpu6050_addr, cmd, 2, false);
     sleep_ms(100);
-    
+
     // Wake up again
     cmd[0] = MPU6050_PWR_MGMT_1;
     cmd[1] = 0x00;
     i2c_write_blocking(I2C_MPU, mpu6050_addr, cmd, 2, false);
     sleep_ms(100);
-    
+
     // Set accel config to ±2g range
     cmd[0] = MPU6050_ACCEL_CONFIG;
     cmd[1] = 0x00;
     i2c_write_blocking(I2C_MPU, mpu6050_addr, cmd, 2, false);
     sleep_ms(10);
-    
+
     // Configure sample rate divider (1 kHz sampling)
     cmd[0] = 0x19;  // SMPRT_DIV register
     cmd[1] = 0x00;  // Sample rate = 1000 / (1 + 0) = 1kHz
@@ -194,45 +254,50 @@ void apply_calibration(float *x, float *y, float *z) {
 
 mpu6050_reading_t read_mpu6050(void) {
     mpu6050_reading_t result = {0, 0, 0, 0, false};
-    
+
     if (!mpu6050_addr) return result;
-    
+
     uint8_t buffer[8];
     uint8_t reg = MPU6050_ACCEL_XOUT_H;
-    
-    i2c_write_blocking(I2C_MPU, mpu6050_addr, &reg, 1, true);
-    i2c_read_blocking(I2C_MPU, mpu6050_addr, buffer, 8, false);
-    
+
+    int write_result = i2c_write_blocking(I2C_MPU, mpu6050_addr, &reg, 1, true);
+    int read_result = i2c_read_blocking(I2C_MPU, mpu6050_addr, buffer, 8, false);
+
+    if (write_result < 0 || read_result < 0) {
+        // Silently fail on read error (don't spam output)
+        return result;
+    }
+
     // Convert accel data (16384 LSBs per g for ±2g range)
     int16_t accel_x_raw = ((int16_t)buffer[0] << 8) | buffer[1];
     int16_t accel_y_raw = ((int16_t)buffer[2] << 8) | buffer[3];
     int16_t accel_z_raw = ((int16_t)buffer[4] << 8) | buffer[5];
-    
+
     result.accel_x = accel_x_raw / 16384.0f;
     result.accel_y = accel_y_raw / 16384.0f;
     result.accel_z = accel_z_raw / 16384.0f;
-    
+
     // Apply calibration
     apply_calibration(&result.accel_x, &result.accel_y, &result.accel_z);
-    
+
     // Convert temperature (raw / 340 + 36.53)
     int16_t temp_raw = ((int16_t)buffer[6] << 8) | buffer[7];
     result.temperature = (temp_raw / 340.0f) + 36.53f;
-    
+
     result.valid = true;
     return result;
 }
 
-// ============ FREQUENCY COUNTER ISR ============
+// ============ FREQUENCY COUNTER ISR (for PIO0) ============
 static void pio0_isr(void) {
-    uint32_t raw_clock = pio_sm_get_blocking(pio, sm_clock);
-    uint32_t raw_pulse = pio_sm_get_blocking(pio, sm_pulse);
+    uint32_t raw_clock = pio_sm_get_blocking(pio_freq, sm_clock);
+    uint32_t raw_pulse = pio_sm_get_blocking(pio_freq, sm_pulse);
 
     g_clock_cycles = 2u * (0xFFFFFFFFu - raw_clock);  // 2 cycles/iteration in clock_count
     g_pulse_count  = (0xFFFFFFFEu) - raw_pulse;        // pulse_count's X started at max-1
     g_result_ready = true;
 
-    pio_interrupt_clear(pio, 0);  // lets gate SM proceed to the next window
+    pio_interrupt_clear(pio_freq, 0);  // lets gate SM proceed to the next window
 }
 
 // ============ SD CARD FUNCTIONS ============
@@ -255,35 +320,50 @@ void write_buffer_to_sd(void) {
 // ============ MAIN ============
 int main() {
     stdio_init_all();
-    
-    // Initial boot pattern: 3 blinks
-    blink_led(3);
-    
-    // Wait for USB serial receive end connection (if connected)
-    sleep_ms(3000);
 
-    printf("Pico Frequency Counter + MPU-6050 Logger v%s\n", VERSION);
+    // Wait for USB enumeration
+    sleep_ms(4000);
 
-    // Initialize I2C for RTC
-    i2c_init(I2C_RTC, 400 * 1000);
+    // Send startup message immediately
+    printf("\n\n=== Pico Frequency Counter + MPU-6050 Logger v%s ===\n", VERSION);
+    fflush(stdout);
+
+    // Initialize I2C
+    i2c_init(I2C_RTC, 100 * 1000);
     gpio_set_function(I2C_RTC_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_RTC_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_RTC_SDA);
     gpio_pull_up(I2C_RTC_SCL);
 
-    // Initialize I2C for MPU
     i2c_init(I2C_MPU, 400 * 1000);
     gpio_set_function(I2C_MPU_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_MPU_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_MPU_SDA);
     gpio_pull_up(I2C_MPU_SCL);
 
-    // Read RTC for filename and timestamp
-    ds3231_time_t start_time;
-    read_ds3231_time(&start_time);
+    // Read RTC
+    ds3231_time_t start_time = {0, 0, 0, 0, 1, 1, 26};  // Default fallback
+    uint8_t buffer[7];
+    uint8_t reg = 0x00;
+
+    int write_result = i2c_write_blocking(I2C_RTC, DS3231_ADDR, &reg, 1, true);
+    if (write_result > 0) {
+        int read_result = i2c_read_blocking(I2C_RTC, DS3231_ADDR, buffer, 7, false);
+        if (read_result > 0) {
+            start_time.seconds = bcd_to_decimal(buffer[0]);
+            start_time.minutes = bcd_to_decimal(buffer[1]);
+            start_time.hours = bcd_to_decimal(buffer[2] & 0x3F);
+            start_time.day_of_week = buffer[3];
+            start_time.date = bcd_to_decimal(buffer[4]);
+            start_time.month = bcd_to_decimal(buffer[5] & 0x1F);
+            start_time.year = bcd_to_decimal(buffer[6]);
+        }
+    }
+
     printf("RTC time: 20%02d-%02d-%02d %02d:%02d:%02d UTC\n",
            start_time.year, start_time.month, start_time.date,
            start_time.hours, start_time.minutes, start_time.seconds);
+    fflush(stdout);
 
     // Create filename from date/time
     char filename[32];
@@ -291,7 +371,6 @@ int main() {
              start_time.month, start_time.date, start_time.hours, start_time.minutes);
 
     // Initialize SD card
-    printf("Initializing SD card...\n");
     FATFS fs;
     FRESULT fr = f_mount(&fs, "", 1);
     if (FR_OK != fr) {
@@ -308,62 +387,95 @@ int main() {
     bool is_new_file = (f_size(&fil) == 0);
 
     printf("File: %s (%s)\n", filename, is_new_file ? "new" : "appending");
+    fflush(stdout);
 
-    // Initialize MPU-6050
     init_mpu6050();
-    printf("MPU-6050 initialized\n");
-    
-    // Boot complete pattern: 2 blinks
-    blink_led(2);
 
-    // Initialize frequency counter PIO
-    uint offset_gate  = pio_add_program(pio, &gate_program);
-    uint offset_clock = pio_add_program(pio, &clock_count_program);
-    uint offset_pulse = pio_add_program(pio, &pulse_count_program);
+    // ============ INITIALIZE WS2812 LED (on PIO1) ============
+    uint offset_ws2812 = pio_add_program(pio_led, &ws2812_program);
+    sm_ws2812 = pio_claim_unused_sm(pio_led, true);
+    ws2812_program_init(pio_led, sm_ws2812, offset_ws2812, WS2812_PIN, 800000, false);
 
-    sm_gate  = pio_claim_unused_sm(pio, true);
-    sm_clock = pio_claim_unused_sm(pio, true);
-    sm_pulse = pio_claim_unused_sm(pio, true);
+    // Boot test pattern: test different colors at 10% brightness
+    printf("Testing LED colors at 10%% brightness...\n");
+    fflush(stdout);
+
+    printf("  Red 10%%...\n");
+    fflush(stdout);
+    ws2812_led_on(LED_RED_10PCT);
+    sleep_ms(500);
+
+    printf("  Green 10%%...\n");
+    fflush(stdout);
+    ws2812_led_on(LED_GREEN_10PCT);
+    sleep_ms(500);
+
+    printf("  Blue 10%%...\n");
+    fflush(stdout);
+    ws2812_led_on(LED_BLUE_10PCT);
+    sleep_ms(500);
+
+    printf("  Yellow 10%%...\n");
+    fflush(stdout);
+    ws2812_led_on(LED_YELLOW_10PCT);
+    sleep_ms(500);
+
+    printf("  OFF...\n");
+    fflush(stdout);
+    ws2812_led_off();
+    sleep_ms(500);
+
+    printf("Boot test pattern complete\n");
+    fflush(stdout);
+
+    // ============ INITIALIZE FREQUENCY COUNTER (on PIO0) ============
+    uint offset_gate  = pio_add_program(pio_freq, &gate_program);
+    uint offset_clock = pio_add_program(pio_freq, &clock_count_program);
+    uint offset_pulse = pio_add_program(pio_freq, &pulse_count_program);
+
+    sm_gate  = pio_claim_unused_sm(pio_freq, true);
+    sm_clock = pio_claim_unused_sm(pio_freq, true);
+    sm_pulse = pio_claim_unused_sm(pio_freq, true);
 
     gpio_init(FREQ_PIN);
     gpio_set_dir(FREQ_PIN, GPIO_IN);
 
-    pio_gpio_init(pio, GATE_PIN);
-    pio_gpio_init(pio, PULSE_FIN_PIN);
+    pio_gpio_init(pio_freq, GATE_PIN);
+    pio_gpio_init(pio_freq, PULSE_FIN_PIN);
 
     // Configure gate state machine
     pio_sm_config c_gate = gate_program_get_default_config(offset_gate);
     sm_config_set_in_pins(&c_gate, FREQ_PIN);
     sm_config_set_sideset_pins(&c_gate, GATE_PIN);
-    pio_sm_set_consecutive_pindirs(pio, sm_gate, GATE_PIN, 1, true);
-    pio_sm_init(pio, sm_gate, offset_gate, &c_gate);
+    pio_sm_set_consecutive_pindirs(pio_freq, sm_gate, GATE_PIN, 1, true);
+    pio_sm_init(pio_freq, sm_gate, offset_gate, &c_gate);
 
     // Configure clock_count state machine
     pio_sm_config c_clock = clock_count_program_get_default_config(offset_clock);
     sm_config_set_in_pins(&c_clock, GATE_PIN);
     sm_config_set_jmp_pin(&c_clock, PULSE_FIN_PIN);
-    pio_sm_init(pio, sm_clock, offset_clock, &c_clock);
+    pio_sm_init(pio_freq, sm_clock, offset_clock, &c_clock);
 
     // Configure pulse_count state machine
     pio_sm_config c_pulse = pulse_count_program_get_default_config(offset_pulse);
     sm_config_set_in_pins(&c_pulse, GATE_PIN);  // offset 0 = GATE_PIN, offset 1 = FREQ_PIN
     sm_config_set_sideset_pins(&c_pulse, PULSE_FIN_PIN);
     sm_config_set_jmp_pin(&c_pulse, GATE_PIN);
-    pio_sm_set_consecutive_pindirs(pio, sm_pulse, PULSE_FIN_PIN, 1, true);
-    pio_sm_init(pio, sm_pulse, offset_pulse, &c_pulse);
+    pio_sm_set_consecutive_pindirs(pio_freq, sm_pulse, PULSE_FIN_PIN, 1, true);
+    pio_sm_init(pio_freq, sm_pulse, offset_pulse, &c_pulse);
 
     // Preload each SM's one-time constant
-    pio_sm_put_blocking(pio, sm_gate,  GATE_NOMINAL_CYCLES);
-    pio_sm_put_blocking(pio, sm_clock, 0xFFFFFFFFu);
-    pio_sm_put_blocking(pio, sm_pulse, 0xFFFFFFFEu);
+    pio_sm_put_blocking(pio_freq, sm_gate,  GATE_NOMINAL_CYCLES);
+    pio_sm_put_blocking(pio_freq, sm_clock, 0xFFFFFFFFu);
+    pio_sm_put_blocking(pio_freq, sm_pulse, 0xFFFFFFFEu);
 
-    // Set up interrupt
-    pio_set_irq0_source_enabled(pio, pis_interrupt0, true);
+    // Set up interrupt for PIO0
+    pio_set_irq0_source_enabled(pio_freq, pis_interrupt0, true);
     irq_set_exclusive_handler(PIO0_IRQ_0, pio0_isr);
     irq_set_enabled(PIO0_IRQ_0, true);
 
     uint32_t mask = (1u << sm_gate) | (1u << sm_clock) | (1u << sm_pulse);
-    pio_enable_sm_mask_in_sync(pio, mask);
+    pio_enable_sm_mask_in_sync(pio_freq, mask);
 
     printf("Ready to measure (250 ms gate windows)\n");
     printf("Waiting for first frequency measurement...\n");
@@ -396,13 +508,12 @@ int main() {
     // Reset elapsed time for actual data logging
     elapsed_sec = 0.0f;
 
-    // Read RTC again just before starting data collection for accurate start time
-    ds3231_time_t recording_start_time;
-    read_ds3231_time(&recording_start_time);
-    
-    // Write actual recording start time to SD card (only if new file)
+    // Use default recording start time (RTC read skipped - see above)
+    ds3231_time_t recording_start_time = {0, 0, 0, 0, 1, 1, 26};
+
+    // Write recording start time to SD card (only if new file)
     if (is_new_file) {
-        f_printf(&fil, "# Start: 20%02d-%02d-%02d %02d:%02d:%02d UTC\n",
+        f_printf(&fil, "# Start: 20%02d-%02d-%02d %02d:%02d:%02d UTC (DEFAULT)\n",
                  recording_start_time.year, recording_start_time.month, recording_start_time.date,
                  recording_start_time.hours, recording_start_time.minutes, recording_start_time.seconds);
         f_printf(&fil, "# Initial frequency: %.2f Hz\n", initial_freq_hz);
