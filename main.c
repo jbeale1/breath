@@ -27,7 +27,7 @@
 #include "f_util.h"
 #include "ff.h"
 
-#define VERSION "1.1.5"
+#define VERSION "1.1.7"
 
 // ============ PIN DEFINITIONS ============
 #define WS2812_PIN 16   // WS2812 RGB LED on RP2040-Zero
@@ -45,7 +45,7 @@
 #define I2C_MPU_SCL 15
 #define MPU6050_ADDR 0x68
 
-// Frequency counter PIO pins
+// Frequency counter internal-use PIO pins
 #define GATE_PIN      2
 #define PULSE_FIN_PIN 4
 
@@ -55,10 +55,10 @@
 #define MPU6050_ACCEL_XOUT_H 0x3B
 #define MPU6050_TEMP_OUT_H 0x41
 
-// MPU-6050 Calibration Enable/Disable
+// MPU-6050 External Calibration Factors Enable/Disable
 #define ENABLE_CALIBRATION 1
 
-// Calibration Constants (measured 2026-09-24)
+// Calibration Constants for a specific MPU-6050 (measured 2026-09-24)
 #define CALIB_OFFSET_X 0.03092250f
 #define CALIB_SCALE_X  1.00047773f
 #define CALIB_OFFSET_Y -0.01023000f
@@ -321,11 +321,27 @@ void write_buffer_to_sd(void) {
 int main() {
     stdio_init_all();
 
+    // ============ INITIALIZE WS2812 LED (on PIO1) ============
+    uint offset_ws2812 = pio_add_program(pio_led, &ws2812_program);
+    sm_ws2812 = pio_claim_unused_sm(pio_led, true);
+    ws2812_program_init(pio_led, sm_ws2812, offset_ws2812, WS2812_PIN, 800000, false);
+
+    ws2812_led_on(LED_RED_10PCT);
+    sleep_ms(500);
+    ws2812_led_on(LED_GREEN_10PCT);
+    sleep_ms(500);
+    ws2812_led_on(LED_BLUE_10PCT);
+    sleep_ms(500);
+    ws2812_led_on(LED_YELLOW_10PCT);
+    sleep_ms(500);
+    ws2812_led_off();
+    sleep_ms(5);
+
     // Wait for USB enumeration
-    sleep_ms(4000);
+    sleep_ms(3000);
 
     // Send startup message immediately
-    printf("\n\n=== Pico Frequency Counter + MPU-6050 Logger v%s ===\n", VERSION);
+    printf("\n\n=== BreathLog v%s ===\n", VERSION);
     fflush(stdout);
 
     // Initialize I2C
@@ -391,42 +407,6 @@ int main() {
 
     init_mpu6050();
 
-    // ============ INITIALIZE WS2812 LED (on PIO1) ============
-    uint offset_ws2812 = pio_add_program(pio_led, &ws2812_program);
-    sm_ws2812 = pio_claim_unused_sm(pio_led, true);
-    ws2812_program_init(pio_led, sm_ws2812, offset_ws2812, WS2812_PIN, 800000, false);
-
-    // Boot test pattern: test different colors at 10% brightness
-    printf("Testing LED colors at 10%% brightness...\n");
-    fflush(stdout);
-
-    printf("  Red 10%%...\n");
-    fflush(stdout);
-    ws2812_led_on(LED_RED_10PCT);
-    sleep_ms(500);
-
-    printf("  Green 10%%...\n");
-    fflush(stdout);
-    ws2812_led_on(LED_GREEN_10PCT);
-    sleep_ms(500);
-
-    printf("  Blue 10%%...\n");
-    fflush(stdout);
-    ws2812_led_on(LED_BLUE_10PCT);
-    sleep_ms(500);
-
-    printf("  Yellow 10%%...\n");
-    fflush(stdout);
-    ws2812_led_on(LED_YELLOW_10PCT);
-    sleep_ms(500);
-
-    printf("  OFF...\n");
-    fflush(stdout);
-    ws2812_led_off();
-    sleep_ms(500);
-
-    printf("Boot test pattern complete\n");
-    fflush(stdout);
 
     // ============ INITIALIZE FREQUENCY COUNTER (on PIO0) ============
     uint offset_gate  = pio_add_program(pio_freq, &gate_program);
@@ -528,12 +508,19 @@ int main() {
     // Write recording start time to SD card (only if new file)
     if (is_new_file) {
         f_printf(&fil, "# Start: 20%02d-%02d-%02d %02d:%02d:%02d UTC  BreathLog Version: %s\n",
-                 VERSION,
                  recording_start_time.year, recording_start_time.month, recording_start_time.date,
-                 recording_start_time.hours, recording_start_time.minutes, recording_start_time.seconds);
+                 recording_start_time.hours, recording_start_time.minutes, recording_start_time.seconds,
+                 VERSION);
         f_printf(&fil, "# Initial frequency: %.2f Hz\n", initial_freq_hz);
         f_printf(&fil, "elapsed_sec,delta_hz,accel_x,accel_y,accel_z,temp_c\n");
         f_sync(&fil);
+    }
+
+    for (int i = 0; i < 2; i++) {  // 2 green blinks to indicate ready state
+        ws2812_led_on(LED_GREEN_10PCT);
+        sleep_ms(300);
+        ws2812_led_off();
+        sleep_ms(300);
     }
 
     // ============ MAIN LOOP ============
