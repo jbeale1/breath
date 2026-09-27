@@ -27,7 +27,7 @@
 #include "f_util.h"
 #include "ff.h"
 
-#define VERSION "1.1.2"
+#define VERSION "1.1.5"
 
 // ============ PIN DEFINITIONS ============
 #define WS2812_PIN 16   // WS2812 RGB LED on RP2040-Zero
@@ -139,9 +139,9 @@ static uint8_t mpu6050_addr = 0x68;
 #define LED_BLUE   urgb_u32(0, 0, 255)
 #define LED_BLACK  urgb_u32(0, 0, 0)
 
-// 10% brightness colors for testing
-#define LED_RED_10PCT    urgb_u32(25, 0, 0)
-#define LED_GREEN_10PCT  urgb_u32(0, 25, 0)
+// 10% brightness colors for testing. This device uses GRB format  
+#define LED_GREEN_10PCT  urgb_u32(25, 0, 0)
+#define LED_RED_10PCT    urgb_u32(0, 25, 0)
 #define LED_BLUE_10PCT   urgb_u32(0, 0, 25)
 #define LED_YELLOW_10PCT urgb_u32(25, 25, 0)
 
@@ -508,12 +508,27 @@ int main() {
     // Reset elapsed time for actual data logging
     elapsed_sec = 0.0f;
 
-    // Use default recording start time (RTC read skipped - see above)
+    // Use default recording start time if RTC read failed
     ds3231_time_t recording_start_time = {0, 0, 0, 0, 1, 1, 26};
+
+    write_result = i2c_write_blocking(I2C_RTC, DS3231_ADDR, &reg, 1, true);
+    if (write_result > 0) {
+        int read_result = i2c_read_blocking(I2C_RTC, DS3231_ADDR, buffer, 7, false);
+        if (read_result > 0) {
+            recording_start_time.seconds = bcd_to_decimal(buffer[0]);
+            recording_start_time.minutes = bcd_to_decimal(buffer[1]);
+            recording_start_time.hours = bcd_to_decimal(buffer[2] & 0x3F);
+            recording_start_time.day_of_week = buffer[3];
+            recording_start_time.date = bcd_to_decimal(buffer[4]);
+            recording_start_time.month = bcd_to_decimal(buffer[5] & 0x1F);
+            recording_start_time.year = bcd_to_decimal(buffer[6]);
+        }
+    }
 
     // Write recording start time to SD card (only if new file)
     if (is_new_file) {
-        f_printf(&fil, "# Start: 20%02d-%02d-%02d %02d:%02d:%02d UTC (DEFAULT)\n",
+        f_printf(&fil, "# Start: 20%02d-%02d-%02d %02d:%02d:%02d UTC  BreathLog Version: %s\n",
+                 VERSION,
                  recording_start_time.year, recording_start_time.month, recording_start_time.date,
                  recording_start_time.hours, recording_start_time.minutes, recording_start_time.seconds);
         f_printf(&fil, "# Initial frequency: %.2f Hz\n", initial_freq_hz);
