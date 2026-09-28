@@ -6,7 +6,8 @@
 #include "hardware/i2c.h"
 #include "ff.h"
 
-#define I2C_PORT i2c1
+// RP2040-Zero board has RTC on I2C0 bus  JPB 9/27/2026
+#define I2C_PORT i2c0
 #define DS3231_ADDR 0x68
 
 // Required by crash.c
