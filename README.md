@@ -21,4 +21,4 @@ Initial frequency: 965186.58 Hz
 2.50 s: freq= 966564.41 Hz, delta=  +42.25 Hz, ax=0.7268, ay=0.1026, az=0.6848, T=23.96 C
 ```
 
-![Block Diagram of data logger](block_diagram.png)
+![data logger design](breathlog_schematic1.png)
